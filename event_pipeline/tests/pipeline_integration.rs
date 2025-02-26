@@ -2,9 +2,9 @@ use event_pipeline::notifier::Notifier;
 use event_pipeline::notifier_event::{NotifierEvent, NotifierEventType};
 use event_pipeline::pipeline::{
     process_pipeline, CreateBookingCallForTravelProvider, GetPaymentStatusFromPaymentProvider,
-    MockStep, PipelineDecision, PipelineStep, ServerSideBookingEvent,
+    MockStep, PipelineDecision, PipelineStep, SendEmailNotification, ServerSideBookingEvent,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
@@ -456,5 +456,204 @@ mod test {
                 i + 1
             );
         }
+    }
+
+    /// Test for sending email via pipeline
+    ///
+    /// Scenario:
+    ///   - Create a pipeline with a SendEmail step
+    ///   - Run the pipeline via a Notifier
+    ///   - Verify that the pipeline completes successfully
+    ///   - Verify that the correct events are published
+    #[test(tokio::test)]
+    async fn test_pipeline_with_email_notification() {
+        // Create a Notifier using the bus
+        let notifier = Notifier::with_bus();
+
+        // get the bus this notifier uses
+        let bus = notifier.bus.as_ref().unwrap().clone();
+
+        // Subscribe with a topic pattern
+        let (subscriber_id, subscription_receiver) = bus.subscribe("booking:*".to_string()).await;
+        dbg!(&subscriber_id);
+        // Wrap in a ReceiverStream so we can call .next()
+        let mut subscription_stream = ReceiverStream::new(subscription_receiver);
+
+        // Create a pipeline with a SendEmail step
+        let step = PipelineStep::SendEmail(SendEmailNotification);
+
+        // Prepare the input event
+        let event = ServerSideBookingEvent {
+            payment_id: None, // Not needed for email
+            booking_id: "book_789".to_string(),
+            user_email: "test_email@example.com".to_string(),
+        };
+
+        // Run the pipeline
+        let result = process_pipeline(event, &[step], Some(&notifier)).await;
+        assert!(result.is_ok(), "Pipeline should have succeeded");
+
+        // Collect events. We expect 4 total for a single step:
+        //    1) OnPipelineStart
+        //    2) OnStepStart
+        //    3) OnStepCompleted
+        //    4) OnPipelineEnd
+        let mut published_events = vec![];
+        let mut count = 0;
+        while count < 4 {
+            if let Some(evt) = subscription_stream.next().await {
+                published_events.push(evt.payload);
+                count += 1;
+            } else {
+                break;
+            }
+        }
+
+        // Check that we have the events we expect
+        let types: Vec<NotifierEventType> = published_events
+            .iter()
+            .map(|e| e.event_type.clone())
+            .collect();
+
+        assert!(types.contains(&NotifierEventType::OnPipelineStart));
+        assert!(types.contains(&NotifierEventType::OnStepStart));
+        assert!(types.contains(&NotifierEventType::OnStepCompleted));
+        assert!(types.contains(&NotifierEventType::OnPipelineEnd));
+
+        // Verify that the step name in the events is correct
+        let step_events: Vec<&NotifierEvent> = published_events
+            .iter()
+            .filter(|e| e.step_name.is_some())
+            .collect();
+        
+        for evt in step_events {
+            assert_eq!(
+                evt.step_name.as_ref().unwrap(),
+                "SendEmailNotification",
+                "Step name should be SendEmailNotification"
+            );
+        }
+    }
+
+    /// Test for a complete booking workflow with email notification
+    ///
+    /// Scenario:
+    ///   - Create a pipeline with multiple steps: payment status check, booking call, and email notification
+    ///   - Run the pipeline via a Notifier
+    ///   - Verify that the pipeline completes successfully
+    ///   - Verify that the correct events are published in the expected order
+    #[test(tokio::test)]
+    async fn test_complete_booking_workflow_with_email() {
+        // Create a Notifier using the bus
+        let notifier = Notifier::with_bus();
+
+        // get the bus this notifier uses
+        let bus = notifier.bus.as_ref().unwrap().clone();
+
+        // Subscribe with a topic pattern
+        let (subscriber_id, subscription_receiver) = bus.subscribe("booking:*".to_string()).await;
+        dbg!(&subscriber_id);
+        // Wrap in a ReceiverStream so we can call .next()
+        let mut subscription_stream = ReceiverStream::new(subscription_receiver);
+
+        // Create a pipeline with multiple steps
+        let step1 = PipelineStep::PaymentStatus(GetPaymentStatusFromPaymentProvider);
+        let step2 = PipelineStep::BookingCall(CreateBookingCallForTravelProvider);
+        let step3 = PipelineStep::SendEmail(SendEmailNotification);
+
+        // Prepare the input event
+        let event = ServerSideBookingEvent {
+            payment_id: Some("pay_workflow_123".to_string()),
+            booking_id: "book_workflow_456".to_string(),
+            user_email: "workflow_test@example.com".to_string(),
+        };
+
+        // Run the pipeline
+        let result = process_pipeline(event, &[step1, step2, step3], Some(&notifier)).await;
+        assert!(result.is_ok(), "Pipeline should have succeeded");
+
+        // Collect events. We expect 8 total for three steps:
+        //    1) OnPipelineStart
+        //    2) Step1 OnStepStart
+        //    3) Step1 OnStepCompleted
+        //    4) Step2 OnStepStart
+        //    5) Step2 OnStepCompleted
+        //    6) Step3 OnStepStart
+        //    7) Step3 OnStepCompleted
+        //    8) OnPipelineEnd
+        let mut published_events = vec![];
+        let mut count = 0;
+        while count < 8 {
+            if let Some(evt) = subscription_stream.next().await {
+                published_events.push(evt.payload);
+                count += 1;
+            } else {
+                break;
+            }
+        }
+
+        // Check that we have the events we expect
+        let types: Vec<NotifierEventType> = published_events
+            .iter()
+            .map(|e| e.event_type.clone())
+            .collect();
+
+        assert!(types.contains(&NotifierEventType::OnPipelineStart));
+        assert_eq!(
+            types
+                .iter()
+                .filter(|&t| *t == NotifierEventType::OnStepStart)
+                .count(),
+            3
+        );
+        assert_eq!(
+            types
+                .iter()
+                .filter(|&t| *t == NotifierEventType::OnStepCompleted)
+                .count(),
+            3
+        );
+        assert!(types.contains(&NotifierEventType::OnPipelineEnd));
+
+        // Verify the order of events
+        assert_eq!(types[0], NotifierEventType::OnPipelineStart);
+        assert_eq!(types[1], NotifierEventType::OnStepStart); // Step1
+        assert_eq!(types[2], NotifierEventType::OnStepCompleted); // Step1
+        assert_eq!(types[3], NotifierEventType::OnStepStart); // Step2
+        assert_eq!(types[4], NotifierEventType::OnStepCompleted); // Step2
+        assert_eq!(types[5], NotifierEventType::OnStepStart); // Step3
+        assert_eq!(types[6], NotifierEventType::OnStepCompleted); // Step3
+        assert_eq!(types[7], NotifierEventType::OnPipelineEnd);
+
+        // Verify the step names in the events
+        let step_events: Vec<&NotifierEvent> = published_events
+            .iter()
+            .filter(|e| e.step_name.is_some())
+            .collect();
+        
+        assert_eq!(
+            step_events[0].step_name.as_ref().unwrap(),
+            "GetPaymentStatusFromPaymentProvider"
+        );
+        assert_eq!(
+            step_events[1].step_name.as_ref().unwrap(),
+            "GetPaymentStatusFromPaymentProvider"
+        );
+        assert_eq!(
+            step_events[2].step_name.as_ref().unwrap(),
+            "CreateBookingCallForTravelProvider"
+        );
+        assert_eq!(
+            step_events[3].step_name.as_ref().unwrap(),
+            "CreateBookingCallForTravelProvider"
+        );
+        assert_eq!(
+            step_events[4].step_name.as_ref().unwrap(),
+            "SendEmailNotification"
+        );
+        assert_eq!(
+            step_events[5].step_name.as_ref().unwrap(),
+            "SendEmailNotification"
+        );
     }
 }
