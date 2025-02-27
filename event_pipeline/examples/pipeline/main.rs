@@ -1,16 +1,19 @@
 use axum::{
     extract::{Path, State},
-    response::{sse::{Event, Sse}, IntoResponse},
+    response::{sse::{Event, Sse}, IntoResponse, Json},
     routing::{get, post},
-    Json, Router,
+    Router,
 };
 use event_pipeline::{
     notifier::Notifier,
     notifier_event::{NotifierEvent, NotifierEventType},
+    pipeline::{
+        process_pipeline, MockStep, PipelineDecision, PipelineStep, ServerSideBookingEvent,
+    },
     uuidv7,
 };
 use serde::{Deserialize, Serialize};
-use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
+use std::{convert::Infallible, net::SocketAddr, sync::Arc, sync::atomic::AtomicBool, time::Duration};
 use tokio_event_bus::EventBus;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -35,6 +38,14 @@ struct BookingStatusResponse {
     event_id: String,
 }
 
+// Response for a pipeline execution
+#[derive(Debug, Serialize)]
+struct PipelineResponse {
+    message: String,
+    success: bool,
+    details: String,
+}
+
 #[tokio::main]
 async fn main() {
     // Initialize tracing
@@ -56,6 +67,7 @@ async fn main() {
     let app = Router::new()
         .route("/events/:booking_id", get(sse_handler))
         .route("/booking/status", post(update_booking_status))
+        .route("/pipeline/:booking_id", get(pipeline_handler))
         .with_state(state);
 
     // Run the server
@@ -163,4 +175,56 @@ async fn update_booking_status(
         message: "Booking status updated successfully".to_string(),
         event_id,
     })
+}
+
+// Handler for running a pipeline with MockSteps
+async fn pipeline_handler(
+    Path(booking_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    info!("Running pipeline for booking_id: {}", booking_id);
+
+    // Create a ServerSideBookingEvent from the booking_id
+    let event = ServerSideBookingEvent {
+        payment_id: Some("pay_".to_string() + &booking_id),
+        booking_id: booking_id.clone(),
+        user_email: "test@example.com".to_string(),
+    };
+
+    // Create three MockSteps with different behaviors
+    let step1 = PipelineStep::Mock(MockStep {
+        decision: PipelineDecision::Run,
+        executed: Arc::new(AtomicBool::new(false)),
+    });
+
+    let step2 = PipelineStep::Mock(MockStep {
+        decision: PipelineDecision::Skip,
+        executed: Arc::new(AtomicBool::new(false)),
+    });
+
+    let step3 = PipelineStep::Mock(MockStep {
+        decision: if booking_id.contains("fail") {
+            PipelineDecision::Abort("Booking ID contains 'fail'".into())
+        } else {
+            PipelineDecision::Run
+        },
+        executed: Arc::new(AtomicBool::new(false)),
+    });
+
+    // Run the pipeline
+    let result = process_pipeline(event, &[step1, step2, step3], Some(&state.notifier)).await;
+
+    // Return a response based on the pipeline result
+    match result {
+        Ok(_) => Json(PipelineResponse {
+            message: "Pipeline completed successfully".to_string(),
+            success: true,
+            details: "All steps processed. Step 1 executed, Step 2 skipped, Step 3 executed.".to_string(),
+        }),
+        Err(reason) => Json(PipelineResponse {
+            message: "Pipeline failed".to_string(),
+            success: false,
+            details: reason,
+        }),
+    }
 }
