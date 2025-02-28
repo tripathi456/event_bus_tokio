@@ -126,6 +126,7 @@ fn step_name(step: &PipelineStep) -> String {
     match step {
         PipelineStep::PaymentStatus(_) => "GetPaymentStatusFromPaymentProvider".to_owned(),
         PipelineStep::BookingCall(_) => "CreateBookingCallForTravelProvider".to_owned(),
+        PipelineStep::SendEmail(_) => "SendEmailNotification".to_owned(),
         PipelineStep::Mock(_) => "MockStep".to_owned(),
     }
 }

@@ -84,6 +84,29 @@ impl PipelineExecutor for CreateBookingCallForTravelProvider {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct SendEmailNotification;
+
+#[async_trait]
+impl PipelineValidator for SendEmailNotification {
+    async fn validate(&self, event: &ServerSideBookingEvent) -> Result<PipelineDecision, String> {
+        if event.user_email.is_empty() {
+            Ok(PipelineDecision::Abort("Missing user email".into()))
+        } else {
+            Ok(PipelineDecision::Run)
+        }
+    }
+}
+
+#[async_trait]
+impl PipelineExecutor for SendEmailNotification {
+    async fn execute(event: ServerSideBookingEvent) -> Result<ServerSideBookingEvent, String> {
+        println!("Executing SendEmailNotification to: {}", event.user_email);
+        // In a real implementation, this would send an actual email
+        Ok(event)
+    }
+}
+
 // --------------------------
 // Mock Step for Testing
 // --------------------------
@@ -111,6 +134,7 @@ impl PipelineValidator for MockStep {
 pub enum PipelineStep {
     PaymentStatus(GetPaymentStatusFromPaymentProvider),
     BookingCall(CreateBookingCallForTravelProvider),
+    SendEmail(SendEmailNotification),
     Mock(MockStep),
 }
 
@@ -123,6 +147,7 @@ impl PipelineStep {
         match self {
             PipelineStep::PaymentStatus(step) => step.validate(event).await,
             PipelineStep::BookingCall(step) => step.validate(event).await,
+            PipelineStep::SendEmail(step) => step.validate(event).await,
             PipelineStep::Mock(step) => step.validate(event).await,
         }
     }
@@ -139,6 +164,9 @@ impl PipelineStep {
             }
             PipelineStep::BookingCall(_) => {
                 CreateBookingCallForTravelProvider::execute(event).await
+            }
+            PipelineStep::SendEmail(_) => {
+                SendEmailNotification::execute(event).await
             }
             PipelineStep::Mock(step) => {
                 step.executed.store(true, Ordering::SeqCst);
